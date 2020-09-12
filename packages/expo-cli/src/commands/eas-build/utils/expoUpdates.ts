@@ -1,4 +1,11 @@
-import { getConfig, getExpoSDKVersion, getPackageJson } from '@expo/config';
+import {
+  AndroidConfig,
+  ExpoConfig,
+  IOSConfig,
+  getConfig,
+  getExpoSDKVersion,
+  getPackageJson,
+} from '@expo/config';
 import plist from '@expo/plist';
 import { UserManager } from '@expo/xdl';
 import chalk from 'chalk';
@@ -8,35 +15,10 @@ import glob from 'glob';
 import ora from 'ora';
 import path from 'path';
 import xcode from 'xcode';
-import { DOMParser, XMLSerializer } from 'xmldom';
 
 import { gitAddAsync } from '../../../git';
 import log from '../../../log';
 import * as gitUtils from './git';
-
-type ConfigurationOptions =
-  | {
-      sdkVersion: string;
-      runtimeVersion?: undefined;
-      updateUrl: string;
-    }
-  | {
-      sdkVersion?: undefined;
-      runtimeVersion: string;
-      updateUrl: string;
-    };
-
-enum ExpoAndroidMetadata {
-  SDK_VERSION = 'expo.modules.updates.EXPO_SDK_VERSION',
-  RUNTIME_VERSION = 'expo.modules.updates.EXPO_RUNTIME_VERSION',
-  UPDATE_URL = 'expo.modules.updates.EXPO_UPDATE_URL',
-}
-
-enum ExpoIOSMetadata {
-  SDK_VERSION = 'EXUpdatesRuntimeVersion',
-  RUNTIME_VERSION = 'EXUpdatesSDKVersion',
-  UPDATE_URL = 'EXUpdatesURL',
-}
 
 const iOSBuildScript = '../node_modules/expo-updates/scripts/create-manifest-ios.sh';
 const androidBuildScript =
@@ -47,11 +29,11 @@ export async function isUpdatesConfigured(projectDir: string): Promise<boolean> 
     return true;
   }
 
-  const options = await getConfigurationOptions(projectDir);
+  const { exp, username } = await getConfigurationOptions(projectDir);
 
   return (
-    (await isUpdatesConfiguredAndroid(projectDir, options)) &&
-    (await isUpdatesConfiguredIOS(projectDir, options))
+    (await isUpdatesConfiguredAndroid(projectDir, exp, username)) &&
+    (await isUpdatesConfiguredIOS(projectDir, exp, username))
   );
 }
 
@@ -68,13 +50,14 @@ export async function configureUpdatesAsync({
 
   const spinner = ora('Configuring expo-updates');
 
-  const options = await getConfigurationOptions(projectDir);
-
-  await configureUpdatesAndroid(projectDir, options);
-  await configureUpdatesIOS(projectDir, options);
-
   try {
+    const { exp, username } = await getConfigurationOptions(projectDir);
+
+    await configureUpdatesAndroid(projectDir, exp, username);
+    await configureUpdatesIOS(projectDir, exp, username);
+
     await gitUtils.ensureGitStatusIsCleanAsync();
+
     spinner.succeed();
   } catch (err) {
     if (err instanceof gitUtils.DirtyGitTreeError) {
@@ -97,31 +80,20 @@ export async function configureUpdatesAsync({
   }
 }
 
-async function getConfigurationOptions(projectDir: string): Promise<ConfigurationOptions> {
+async function getConfigurationOptions(
+  projectDir: string
+): Promise<{ exp: ExpoConfig; username: string | null }> {
   const user = await UserManager.ensureLoggedInAsync();
 
   const { exp } = getConfig(projectDir);
-  const updateUrl = `https://exp.host/@${user.username}/${exp.slug}`;
 
-  if (exp.runtimeVersion) {
-    return {
-      runtimeVersion: exp.runtimeVersion,
-      updateUrl,
-    };
-  }
-
-  try {
-    const sdkVersion = getExpoSDKVersion(projectDir, exp);
-
-    return {
-      sdkVersion,
-      updateUrl,
-    };
-  } catch (err) {
+  if (!exp.runtimeVersion && !exp.sdkVersion) {
     throw new Error(
       "Couldn't find either 'runtimeVersion' or 'sdkVersion' to configure 'expo-updates'. Please specify at least one of these properties under the 'expo' key in 'app.json'"
     );
   }
+
+  return { exp, username: user.username };
 }
 
 function isExpoUpdatesInstalled(projectDir: string) {
@@ -130,10 +102,7 @@ function isExpoUpdatesInstalled(projectDir: string) {
   return packageJson.dependencies && 'expo-updates' in packageJson.dependencies;
 }
 
-async function configureUpdatesIOS(
-  projectDir: string,
-  { sdkVersion, runtimeVersion, updateUrl }: ConfigurationOptions
-) {
+async function configureUpdatesIOS(projectDir: string, exp: ExpoConfig, username: string | null) {
   const pbxprojPath = await getPbxprojPath(projectDir);
   const project = await getXcodeProject(pbxprojPath);
   const bundleReactNative = await getBundleReactNativePhase(project);
@@ -147,30 +116,31 @@ async function configureUpdatesIOS(
 
   await fs.writeFile(pbxprojPath, project.writeSync());
 
-  const items = runtimeVersion
-    ? {
-        [ExpoIOSMetadata.RUNTIME_VERSION]: runtimeVersion,
-        [ExpoIOSMetadata.UPDATE_URL]: updateUrl,
-      }
-    : {
-        [ExpoIOSMetadata.SDK_VERSION]: sdkVersion,
-        [ExpoIOSMetadata.UPDATE_URL]: updateUrl,
-      };
-
   const expoPlistPath = getExpoPlistPath(projectDir, pbxprojPath);
-  const expoPlist = plist.build(items);
+
+  let expoPlist = {};
+
+  if (await fs.pathExists(path.dirname(expoPlistPath))) {
+    const expoPlistContent = await fs.readFile(expoPlistPath, 'utf8');
+    expoPlist = plist.parse(expoPlistContent);
+  }
+
+  const expoPlistContent = plist.build(
+    IOSConfig.Updates.setUpdatesConfig(exp, expoPlist, username)
+  );
 
   if (!(await fs.pathExists(path.dirname(expoPlistPath)))) {
     await fs.mkdirp(path.dirname(expoPlistPath));
   }
 
-  await fs.writeFile(expoPlistPath, expoPlist);
+  await fs.writeFile(expoPlistPath, expoPlistContent);
   await gitAddAsync(expoPlistPath, { intentToAdd: true });
 }
 
 async function isUpdatesConfiguredIOS(
   projectDir: string,
-  { sdkVersion, runtimeVersion, updateUrl }: ConfigurationOptions
+  exp: ExpoConfig,
+  username: string | null
 ) {
   const pbxprojPath = await getPbxprojPath(projectDir);
   const project = await getXcodeProject(pbxprojPath);
@@ -189,11 +159,15 @@ async function isUpdatesConfiguredIOS(
   const expoPlist = await fs.readFile(expoPlistPath, 'utf8');
   const expoPlistData = plist.parse(expoPlist);
 
+  const currentSdkVersion = IOSConfig.Updates.getSDKVersion(exp);
+  const currentRuntimeVersion = IOSConfig.Updates.getRuntimeVersion(exp);
+  const currentUpdateUrl = IOSConfig.Updates.getUpdateUrl(exp, username);
+
   if (
-    (runtimeVersion
-      ? expoPlistData[ExpoIOSMetadata.RUNTIME_VERSION] === runtimeVersion
-      : expoPlistData[ExpoIOSMetadata.SDK_VERSION] === sdkVersion) &&
-    expoPlistData[ExpoIOSMetadata.UPDATE_URL] === updateUrl
+    (currentRuntimeVersion
+      ? expoPlistData[IOSConfig.Updates.Config.RUNTIME_VERSION] === currentRuntimeVersion
+      : expoPlistData[IOSConfig.Updates.Config.SDK_VERSION] === currentSdkVersion) &&
+    expoPlistData[IOSConfig.Updates.Config.UPDATE_URL] === currentUpdateUrl
   ) {
     return true;
   }
@@ -263,7 +237,11 @@ async function getBundleReactNativePhase(project: xcode.XcodeProject) {
   return bundleReactNative;
 }
 
-async function configureUpdatesAndroid(projectDir: string, options: ConfigurationOptions) {
+async function configureUpdatesAndroid(
+  projectDir: string,
+  exp: ExpoConfig,
+  username: string | null
+) {
   const buildGradlePath = getAndroidBuildGradlePath(projectDir);
   const buildGradleContent = await getAndroidBuildGradleContent(buildGradlePath);
 
@@ -274,29 +252,23 @@ async function configureUpdatesAndroid(projectDir: string, options: Configuratio
     );
   }
 
-  const manifestPath = getAndroidManifestPath(projectDir);
-  const manifestXml = await getAndroidManifest(manifestPath);
+  const androidManifestPath = getAndroidManifestPath(projectDir);
+  const androidManifestJSON = await AndroidConfig.Manifest.readAndroidManifestAsync(
+    androidManifestPath
+  );
 
-  if (!isAndroidMetadataSet(manifestXml, options)) {
-    if (options.runtimeVersion) {
-      removeAndroidMetadata(manifestXml, ExpoAndroidMetadata.SDK_VERSION);
-      updateAndroidMetadata(
-        manifestXml,
-        ExpoAndroidMetadata.RUNTIME_VERSION,
-        options.runtimeVersion
-      );
-    } else if (options.sdkVersion) {
-      removeAndroidMetadata(manifestXml, ExpoAndroidMetadata.RUNTIME_VERSION);
-      updateAndroidMetadata(manifestXml, ExpoAndroidMetadata.SDK_VERSION, options.sdkVersion);
-    }
+  if (!isAndroidMetadataSet(androidManifestJSON, exp, username)) {
+    const result = await AndroidConfig.Updates.setUpdatesConfig(exp, androidManifestJSON, username);
 
-    updateAndroidMetadata(manifestXml, ExpoAndroidMetadata.UPDATE_URL, options.updateUrl);
-
-    await fs.writeFile(manifestPath, new XMLSerializer().serializeToString(manifestXml));
+    await AndroidConfig.Manifest.writeAndroidManifestAsync(androidManifestPath, result);
   }
 }
 
-async function isUpdatesConfiguredAndroid(projectDir: string, options: ConfigurationOptions) {
+async function isUpdatesConfiguredAndroid(
+  projectDir: string,
+  exp: ExpoConfig,
+  username: string | null
+) {
   const buildGradlePath = getAndroidBuildGradlePath(projectDir);
   const buildGradleContent = await getAndroidBuildGradleContent(buildGradlePath);
 
@@ -304,10 +276,12 @@ async function isUpdatesConfiguredAndroid(projectDir: string, options: Configura
     return false;
   }
 
-  const manifestPath = getAndroidManifestPath(projectDir);
-  const manifestXml = await getAndroidManifest(manifestPath);
+  const androidManifestPath = getAndroidManifestPath(projectDir);
+  const androidManifestJSON = await AndroidConfig.Manifest.readAndroidManifestAsync(
+    androidManifestPath
+  );
 
-  if (!isAndroidMetadataSet(manifestXml, options)) {
+  if (!isAndroidMetadataSet(androidManifestJSON, exp, username)) {
     return false;
   }
 
@@ -352,72 +326,43 @@ function getAndroidManifestPath(projectDir: string) {
   return manifestPath;
 }
 
-async function getAndroidManifest(manifestPath: string) {
-  if (!(await fs.pathExists(manifestPath))) {
-    throw new Error(`Couldn't find Android manifest at ${manifestPath}`);
-  }
-
-  const manifestText = await fs.readFile(manifestPath, 'utf8');
-  const manifestXml = new DOMParser().parseFromString(manifestText);
-
-  return manifestXml;
-}
-
 function isAndroidMetadataSet(
-  document: Document,
-  { sdkVersion, runtimeVersion, updateUrl }: ConfigurationOptions
+  androidManifestJSON: AndroidConfig.Manifest.Document,
+  exp: ExpoConfig,
+  username: string | null
 ): boolean {
-  const application = document.getElementsByTagName('application')[0];
-  const sdkVersionMetadata = findAndroidMetadata(application, ExpoAndroidMetadata.SDK_VERSION);
-  const runtimeVersionMetadata = findAndroidMetadata(
-    application,
-    ExpoAndroidMetadata.RUNTIME_VERSION
+  const currentSdkVersion = AndroidConfig.Updates.getSDKVersion(exp);
+  const currentRuntimeVersion = AndroidConfig.Updates.getRuntimeVersion(exp);
+  const currentUpdateUrl = AndroidConfig.Updates.getUpdateUrl(exp, username);
+
+  const setRuntimeVersion = getAndroidMetadataValue(
+    androidManifestJSON,
+    AndroidConfig.Updates.Config.RUNTIME_VERSION
   );
-  const updateUrlMetadata = findAndroidMetadata(application, ExpoAndroidMetadata.UPDATE_URL);
+
+  const setSdkVersion = getAndroidMetadataValue(
+    androidManifestJSON,
+    AndroidConfig.Updates.Config.SDK_VERSION
+  );
+
+  const setUpdateUrl = getAndroidMetadataValue(
+    androidManifestJSON,
+    AndroidConfig.Updates.Config.UPDATE_URL
+  );
 
   return Boolean(
-    (runtimeVersion
-      ? runtimeVersionMetadata &&
-        runtimeVersionMetadata.getAttribute('android:value') === runtimeVersion
-      : sdkVersionMetadata && sdkVersionMetadata.getAttribute('android:value') === sdkVersion) &&
-      updateUrlMetadata &&
-      updateUrlMetadata.getAttribute('android:value') === updateUrl
+    (currentRuntimeVersion
+      ? setRuntimeVersion === currentRuntimeVersion
+      : setSdkVersion === currentSdkVersion) && setUpdateUrl === currentUpdateUrl
   );
 }
 
-function findAndroidMetadata(application: Element, name: ExpoAndroidMetadata) {
-  const metadata = (Array.from(application.childNodes) as Element[]).find(
-    node =>
-      node.nodeName === 'meta-data' &&
-      Array.from(node.attributes).some(attr => attr.name === 'android:name' && attr.value === name)
-  );
-
-  return metadata;
-}
-
-function updateAndroidMetadata(document: Document, name: ExpoAndroidMetadata, value: string) {
-  const application = document.getElementsByTagName('application')[0];
-  const metadata = findAndroidMetadata(application, name);
-
-  if (metadata) {
-    metadata.setAttribute('android:value', value);
-  } else {
-    const it = document.createElement('meta-data');
-
-    it.setAttribute('android:name', name);
-    it.setAttribute('android:value', value);
-
-    application.appendChild(document.createTextNode('  '));
-    application.appendChild(it);
-    application.appendChild(document.createTextNode('\n    '));
+function getAndroidMetadataValue(
+  androidManifestJSON: AndroidConfig.Manifest.Document,
+  name: string
+): string | undefined {
+  if (androidManifestJSON.hasOwnProperty('meta-data')) {
+    return androidManifestJSON['meta-data'].find((e: any) => e['$']['android:name'] === name);
   }
-}
-
-function removeAndroidMetadata(document: Document, name: ExpoAndroidMetadata) {
-  const application = document.getElementsByTagName('application')[0];
-  const metadata = findAndroidMetadata(application, name);
-
-  if (metadata) {
-    application.removeChild(metadata);
-  }
+  return undefined;
 }

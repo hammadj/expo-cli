@@ -1,5 +1,16 @@
+import { isNil, omitBy } from 'lodash';
+
 import { ExpoConfig } from '../Config.types';
 import { ExpoPlist } from './IosConfig.types';
+
+export enum Config {
+  ENABLED = 'EXUpdatesEnabled',
+  CHECK_ON_LAUNCH = 'EXUpdatesCheckOnLaunch',
+  LAUNCH_WAIT_MS = 'EXUpdatesLaunchWaitMs',
+  RUNTIME_VERSION = 'EXUpdatesRuntimeVersion',
+  SDK_VERSION = 'EXUpdatesSDKVersion',
+  UPDATE_URL = 'EXUpdatesURL',
+}
 
 export function getUpdateUrl(config: ExpoConfig, username: string | null) {
   const user = typeof config.owner === 'string' ? config.owner : username;
@@ -7,6 +18,10 @@ export function getUpdateUrl(config: ExpoConfig, username: string | null) {
     return null;
   }
   return `https://exp.host/@${user}/${config.slug}`;
+}
+
+export function getRuntimeVersion(config: ExpoConfig) {
+  return typeof config.runtimeVersion === 'string' ? config.runtimeVersion : null;
 }
 
 export function getSDKVersion(config: ExpoConfig) {
@@ -37,27 +52,29 @@ export function setUpdatesConfig(
 ) {
   let newExpoPlist = {
     ...expoPlist,
-    EXUpdatesEnabled: getUpdatesEnabled(config),
-    EXUpdatesURL: getUpdateUrl(config, username),
-    EXUpdatesCheckOnLaunch: getUpdatesCheckOnLaunch(config),
-    EXUpdatesLaunchWaitMs: getUpdatesTimeout(config),
+    [Config.ENABLED]: getUpdatesEnabled(config),
+    [Config.UPDATE_URL]: getUpdateUrl(config, username),
+    [Config.CHECK_ON_LAUNCH]: getUpdatesCheckOnLaunch(config),
+    [Config.LAUNCH_WAIT_MS]: getUpdatesTimeout(config),
   };
 
-  const updateUrl = getUpdateUrl(config, username);
-  if (updateUrl) {
+  const runtimeVersion = getRuntimeVersion(config);
+  if (runtimeVersion) {
     newExpoPlist = {
       ...newExpoPlist,
-      EXUpdatesURL: updateUrl,
+      [Config.RUNTIME_VERSION]: runtimeVersion,
+      [Config.SDK_VERSION]: undefined,
     };
+  } else {
+    const sdkVersion = getSDKVersion(config);
+    if (sdkVersion) {
+      newExpoPlist = {
+        ...newExpoPlist,
+        [Config.SDK_VERSION]: sdkVersion,
+        [Config.RUNTIME_VERSION]: undefined,
+      };
+    }
   }
 
-  const sdkVersion = getSDKVersion(config);
-  if (sdkVersion) {
-    newExpoPlist = {
-      ...newExpoPlist,
-      EXUpdatesSDKVersion: sdkVersion,
-    };
-  }
-
-  return newExpoPlist;
+  return omitBy(newExpoPlist, isNil);
 }

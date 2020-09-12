@@ -820,6 +820,11 @@ export type ExpoConfig = {
    */
   sdkVersion?: string;
   /**
+   * The runtime version for the app. This is useful for bare projects to decide whether the runtime binaries are compatible.
+   * @pattern ^(\\d+\\.\\d+\\.\\d+)$
+   */
+  runtimeVersion?: string;
+  /**
    * Your app version, use whatever versioning scheme that you like.
    */
   version: string;
